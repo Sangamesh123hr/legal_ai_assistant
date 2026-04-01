@@ -33,6 +33,48 @@ except ImportError:
     rag_pipeline = None
 
 
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extract text from PDF file using PyPDF2."""
+    try:
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(file_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        raise ValueError(f"Failed to extract text from PDF: {str(e)}")
+
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from DOCX file."""
+    try:
+        from docx import Document
+
+        doc = Document(file_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    except Exception as e:
+        logger.error(f"DOCX extraction error: {e}")
+        raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
+
+
+def extract_text_from_file(file_path: str, filename: str) -> str:
+    """Extract text from any supported file type."""
+    ext = filename.lower().split(".")[-1]
+
+    if ext == "pdf":
+        return extract_text_from_pdf(file_path)
+    elif ext == "docx":
+        return extract_text_from_docx(file_path)
+    elif ext in ["txt", "md"]:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+
 @router.post("/analyze", response_model=AnalysisResponse, tags=["Analysis"])
 async def analyze_document(request: AnalyzeRequest):
     """Analyze a legal document with optional RAG query."""
@@ -75,14 +117,12 @@ async def query_knowledge_base(request: QueryRequest):
 
     try:
         result = rag_pipeline.query(request.query, k=request.k)
-
         results = [
             QueryResult(
                 content=r["content"], source=r["source"], score=r.get("score", 0.8)
             )
             for r in result.get("results", [])
         ]
-
         return QueryResponse(
             success=result.get("success", False),
             query=request.query,
@@ -98,7 +138,6 @@ async def query_knowledge_base(request: QueryRequest):
 async def batch_analyze(request: BatchAnalyzeRequest):
     """Analyze multiple documents in batch."""
     results, successful, failed = [], 0, 0
-
     for doc in request.documents:
         try:
             results.append({"document": doc[:50] + "...", "success": True})
@@ -108,7 +147,6 @@ async def batch_analyze(request: BatchAnalyzeRequest):
                 {"document": doc[:50] + "...", "success": False, "error": str(e)}
             )
             failed += 1
-
     return BatchAnalyzeResponse(
         success=True,
         total=len(request.documents),
@@ -120,35 +158,74 @@ async def batch_analyze(request: BatchAnalyzeRequest):
 
 @router.post("/ingest", tags=["Knowledge Base"])
 async def ingest_document(file: UploadFile = File(...)):
-    """Ingest a document into the knowledge base."""
+    """Ingest a document (PDF, DOCX, TXT) into the knowledge base."""
     if not RAG_AVAILABLE:
         raise HTTPException(status_code=503, detail="RAG pipeline not available")
 
-    if not any(file.filename.endswith(ext) for ext in settings.ALLOWED_EXTENSIONS):
-        raise HTTPException(status_code=400, detail=f"File type not allowed")
+    if not any(
+        file.filename.lower().endswith(ext) for ext in settings.ALLOWED_EXTENSIONS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type not allowed. Supported: {settings.ALLOWED_EXTENSIONS}",
+        )
 
     try:
-        content = await file.read()
-        text = content.decode("utf-8", errors="ignore")
-
         import tempfile, os
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=file.filename, delete=False
-        ) as f:
-            f.write(text)
-            temp_path = f.name
+        # Save uploaded file temporarily
+        content = await file.read()
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(content)
+            temp_path = tmp.name
 
         try:
-            result = rag_pipeline.ingest_document(temp_path)
-            return {
-                "success": result.get("success", False),
-                "file": file.filename,
-                "chunks": result.get("chunks", 0),
-            }
+            # Extract text based on file type
+            file_ext = file.filename.lower().split(".")[-1]
+
+            if file_ext == "pdf":
+                text = extract_text_from_pdf(temp_path)
+            elif file_ext == "docx":
+                text = extract_text_from_docx(temp_path)
+            else:
+                # For txt/md files, read directly
+                with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+
+            if not text.strip():
+                return {
+                    "success": False,
+                    "file": file.filename,
+                    "error": "No text extracted from document",
+                }
+
+            # Save extracted text as temp file for ingestion
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False
+            ) as txt_tmp:
+                txt_tmp.write(text)
+                txt_path = txt_tmp.name
+
+            try:
+                result = rag_pipeline.ingest_document(txt_path)
+                return {
+                    "success": result.get("success", False),
+                    "file": file.filename,
+                    "chunks": result.get("chunks", 0),
+                    "text_length": len(text),
+                    "message": f"Successfully extracted {len(text)} characters and ingested {result.get('chunks', 0)} chunks",
+                }
+            finally:
+                if os.path.exists(txt_path):
+                    os.remove(txt_path)
+
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -158,7 +235,11 @@ async def ingest_document(file: UploadFile = File(...)):
 async def get_status():
     """Get system status and statistics."""
     if not RAG_AVAILABLE:
-        return {"status": "limited", "rag_available": False}
+        return {
+            "status": "limited",
+            "rag_available": False,
+            "message": "RAG components not initialized",
+        }
 
     try:
         status = rag_pipeline.get_system_status()
