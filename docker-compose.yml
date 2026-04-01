@@ -1,0 +1,32 @@
+# Legal AI Assistant - Production Docker Compose
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: legal-ai-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=0
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - RATE_LIMIT_REQUESTS=100
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - legal-ai-network
+
+networks:
+  legal-ai-network:
+    driver: bridge
