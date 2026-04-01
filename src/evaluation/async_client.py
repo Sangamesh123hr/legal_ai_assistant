@@ -46,7 +46,7 @@ class DeepSeekAsyncClient:
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(config.timeout),
+            timeout=httpx.Timeout(self.timeout),
         )
         return self
 
